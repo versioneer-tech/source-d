@@ -1,107 +1,136 @@
-/*
-Copyright 2024.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	packagerv1alpha1 "github.com/versioneer-tech/source-d/api/v1alpha1"
+	packageralphav1 "github.com/versioneer-tech/source-d/api/alphav1"
 )
 
-// SourceReconciler reconciles a Source object
 type SourceReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-//+kubebuilder:rbac:groups=package.r,resources=sources,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=package.r,resources=sources/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=package.r,resources=sources/finalizers,verbs=update
-//+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Source object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/reconcile
 func (r *SourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
-	var source packagerv1alpha1.Source
+	var source packageralphav1.Source
 	if err := r.Get(ctx, req.NamespacedName, &source); err != nil {
 		if errors.IsNotFound(err) {
-			l.Info("Source %v got deleted", req)
+			l.Info("Source not found, possibly deleted")
 			return ctrl.Result{}, nil
 		}
-		l.Error(err, "Failed to get Source")
+		l.Error(err, "Failed to fetch Source")
 		return ctrl.Result{}, err
 	}
 
-	// Create or update PVC
-	pvc := &corev1.PersistentVolumeClaim{
-		ObjectMeta: ctrl.ObjectMeta{
-			Name:      source.Name,
-			Namespace: source.Namespace, // Use source's namespace
-		},
+	secret := &corev1.Secret{}
+	secretName := types.NamespacedName{Namespace: source.Namespace, Name: source.Spec.Access.SecretName}
+	if err := r.Get(ctx, secretName, secret); err != nil {
+		if errors.IsNotFound(err) {
+			l.Info("Referenced secret not found, requeuing Source for reconciliation")
+			source.Status.Error = fmt.Sprintf("Secret %s not found", source.Spec.Access.SecretName)
+			if updateErr := r.Status().Update(ctx, &source); updateErr != nil {
+				l.Error(updateErr, "Failed to update Source status")
+			}
+			return ctrl.Result{RequeueAfter: time.Minute * 1}, nil
+		}
+		l.Error(err, "Failed to fetch secret")
+		return ctrl.Result{}, err
 	}
 
-	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, pvc, func() error {
-		// Set PVC Spec based on Source object
-		pvc.Spec.StorageClassName = &source.Spec.StorageClassName
-		pvc.Spec.Resources = corev1.ResourceRequirements{
+	awsAccessKeyID := string(secret.Data["AWS_ACCESS_KEY_ID"])
+	awsSecretAccessKey := string(secret.Data["AWS_SECRET_ACCESS_KEY"])
+	awsEndpointURL := string(secret.Data["AWS_ENDPOINT_URL"])
+	awsRegion := string(secret.Data["AWS_REGION"])
+
+	if awsAccessKeyID == "" || awsSecretAccessKey == "" || awsEndpointURL == "" || awsRegion == "" {
+		return ctrl.Result{}, fmt.Errorf("required AWS credentials missing in secret %s", secret.Name)
+	}
+
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   source.Name,
+			Labels: map[string]string{"source-name": source.Name},
+		},
+	}
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, pv, func() error {
+		if pv.Spec.PersistentVolumeSource.CSI == nil {
+			pv.Spec.PersistentVolumeSource = corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:       "csi-rclone",
+					VolumeHandle: source.Spec.Access.BucketName,
+					VolumeAttributes: map[string]string{
+						"remote":               "s3",
+						"remotePath":           source.Spec.Access.BucketName,
+						"s3-provider":          "AWS",
+						"s3-endpoint":          awsEndpointURL,
+						"s3-access-key-id":     awsAccessKeyID,
+						"s3-secret-access-key": awsSecretAccessKey,
+						"s3-region":            awsRegion,
+					},
+				},
+			}
+		}
+		pv.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+		pv.Spec.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}
+		if pv.Spec.StorageClassName == "" {
+			pv.Spec.StorageClassName = "rclone"
+		}
+		return nil
+	})
+	if err != nil {
+		l.Error(err, "Failed to create or update PersistentVolume")
+		return ctrl.Result{}, err
+	}
+	l.Info(fmt.Sprintf("PersistentVolume %s %s", pv.Name, op))
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      source.Name,
+			Namespace: source.Namespace,
+		},
+	}
+	op, err = controllerutil.CreateOrUpdate(ctx, r.Client, pvc, func() error {
+		if err := controllerutil.SetControllerReference(&source, pvc, r.Scheme); err != nil {
+			return err
+		}
+		pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+		pvc.Spec.Resources = corev1.VolumeResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceStorage: resource.MustParse(source.Spec.Size),
+				corev1.ResourceStorage: resource.MustParse("1Mi"),
 			},
 		}
-		pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{
-			corev1.ReadWriteOnce,
-		}
-		// Set controller reference to Source object
-		return controllerutil.SetControllerReference(&source, pvc, r.Scheme)
-
+		pvc.Spec.StorageClassName = &pv.Spec.StorageClassName
+		pvc.Spec.Selector = &metav1.LabelSelector{MatchLabels: pv.Labels}
+		return nil
 	})
 
 	if err != nil {
-		l.Error(err, "Failed to create or update PVC")
+		l.Error(err, "Failed to create or update PersistentVolumeClaim")
 		return ctrl.Result{}, err
 	}
-
-	l.Info("PVC action result", "result", result)
+	l.Info(fmt.Sprintf("PersistentVolumeClaim %s/%s %s", pvc.Namespace, pvc.Name, op))
 
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
 func (r *SourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&packagerv1alpha1.Source{}).
-		Owns(&corev1.PersistentVolumeClaim{}). // Important: Add this line to manage PVCs
+		For(&packageralphav1.Source{}).
+		Owns(&corev1.PersistentVolumeClaim{}).
 		Complete(r)
 }

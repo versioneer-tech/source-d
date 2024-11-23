@@ -1,4 +1,4 @@
-apiVersion: package.r/v1alpha1
+apiVersion: package.r/alphav1
 kind: Source
 metadata:
   labels:

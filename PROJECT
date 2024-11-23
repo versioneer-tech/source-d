@@ -14,6 +14,6 @@ resources:
   controller: true
   domain: package.r
   kind: Source
-  path: github.com/versioneer-tech/source-d/api/v1alpha1
-  version: v1alpha1
+  path: github.com/versioneer-tech/source-d/api/alphav1
+  version: alphav1
 version: "3"

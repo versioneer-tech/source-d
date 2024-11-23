@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1alpha1
+package alphav1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,19 +23,39 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// Access provides details to access the items of the source
+type Access struct {
+	BucketName   string `json:"bucketName,omitempty"`
+	BucketPrefix string `json:"bucketPrefix,omitempty"`
+	SecretName   string `json:"secretName,omitempty"`
+}
+
+// Share provides details to share the items of the source
+type Share struct {
+	BucketName   string `json:"bucketName,omitempty"`
+	BucketPrefix string `json:"bucketPrefix,omitempty"`
+	SecretName   string `json:"secretName,omitempty"`
+}
+
 // SourceSpec defines the desired state of Source
 type SourceSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// Foo is an example field of Source. Edit source_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	FriendlyName string   `json:"friendlyName,omitempty"`
+	AllowedRoles []string `json:"allowedRoles,omitempty"`
+	SubPath      string   `json:"subPath,omitempty"`
+	Mount        string   `json:"mount,omitempty"`
+	Access       Access   `json:"access,omitempty"`
+	Share        Share    `json:"share,omitempty"`
 }
 
 // SourceStatus defines the observed state of Source
 type SourceStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+
+	Error string `json:"error,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -59,6 +79,7 @@ type SourceList struct {
 	Items           []Source `json:"items"`
 }
 
+//nolint:gochecknoinits
 func init() {
 	SchemeBuilder.Register(&Source{}, &SourceList{})
 }
